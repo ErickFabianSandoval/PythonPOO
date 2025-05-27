@@ -1,5 +1,6 @@
 dash
-plotly
 pandas
+plotly
+scikit-learn
+numpy
 pymongo
-gunicorn
