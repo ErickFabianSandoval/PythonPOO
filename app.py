@@ -1,11 +1,13 @@
 import dash
-from dash import html, dcc, Input, Output
+from dash import dcc, html
 import pandas as pd
 import plotly.express as px
-import base64
-import datetime
-import random
+import plotly.graph_objects as go
+from dash.dependencies import Input, Output
 from pymongo import MongoClient
+from sklearn.linear_model import LinearRegression
+import numpy as np
+import base64
 from pymongo.server_api import ServerApi
 
 # URI con tu usuario y contraseña
@@ -14,369 +16,465 @@ uri = f"mongodb+srv://erickfabian845:kikini1@cluster0.v22gzsc.mongodb.net/?retry
 try:
     # Conexión con API de servidor moderna
     client = MongoClient(uri, server_api=ServerApi('1'))
-    db = client["autosDB"]
-    collection = db["precio_autos"]
-
-    # Probar si hay conexión y documentos
-    count = collection.count_documents({})
-    print(f"✅ Conexión exitosa a MongoDB. Documentos en colección: {count}")
+    db = client['DataWareHouse_DB']
+    dfs = {col: pd.DataFrame(list(db[col].find())) for col in ["museos", "zonas", "visitas"]}
+    print(f"✅ Conexión exitosa a MongoDB.")
 
 except Exception as e:
     print("❌ Error al conectar con MongoDB Atlas:")
     print(e)
 
-# Función para consultar datos con filtros
-def query_data(filters=None):
-    if filters:
-        query = {}
-        if 'Manufacturer' in filters and filters['Manufacturer']:
-            query['Manufacturer'] = {'$in': filters['Manufacturer']}
-        if 'Model' in filters and filters['Model']:
-            query['Model'] = {'$in': filters['Model']}
-        if 'Category' in filters and filters['Category']:
-            query['Category'] = {'$in': filters['Category']}
-        if 'Fuel type' in filters and filters['Fuel type']:
-            query['Fuel type'] = {'$in': filters['Fuel type']}
-        if 'Cylinders' in filters and filters['Cylinders']:
-            query['Cylinders'] = {'$in': [int(c) if isinstance(c, str) and c.replace('.','',1).isdigit() else c for c in filters['Cylinders']]}
-        
-        data = list(collection.find(query))
-    else:
-        data = list(collection.find())
-    
-    df = pd.DataFrame(data)
-    
-    # Procesamiento de datos
-    if not df.empty:
-        df_filtered = df[[ 
-            'Model', 'Category', 'Price', 'Production cost US',
-            'Import tariff (%)', 'Import tariff amount',
-            'Total cost from Mexico (with tariff)', 'Manufacturer',
-            'Fuel type', 'Cylinders', 'Gear box type'
-        ]].copy()
+museos = dfs["museos"]
+zonas = dfs["zonas"]
+visitas = dfs["visitas"]
 
-        numeric_cols = ['Price', 'Production cost US', 'Import tariff (%)',
-                      'Import tariff amount', 'Total cost from Mexico (with tariff)']
-        for col in numeric_cols:
-            df_filtered[col] = pd.to_numeric(df_filtered[col], errors='coerce').round(2)
-        
-        # Simular columna de fecha para línea del tiempo
-        start_date = datetime.datetime(2022, 1, 1)
-        df_filtered['Date'] = [start_date + datetime.timedelta(days=random.randint(0, 1200)) for _ in range(len(df_filtered))]
-        
-        return df_filtered
-    else:
-        return pd.DataFrame()
 
-# Función para generar gráficas normales
-def generate_chart(df, dimension, title):
-    if df.empty or dimension not in df.columns:
-        return px.bar(title=f"No data available for {title}")
-    
-    grouped = df.groupby(dimension).agg({
-        'Total cost from Mexico (with tariff)': 'mean',
-        'Production cost US': 'mean'
-    }).reset_index()
-    grouped = grouped.rename(columns={
-        'Total cost from Mexico (with tariff)': 'Mexico + Tariff',
-        'Production cost US': 'USA'
-    })
-    melted = pd.melt(grouped, id_vars=dimension,
-                    value_vars=['Mexico + Tariff', 'USA'],
-                    var_name='Production Origin', value_name='Average Cost')
-    fig = px.bar(melted, x=dimension, y='Average Cost', color='Production Origin', barmode='group',
-                title=title, color_discrete_map={'Mexico + Tariff': '#60809c', 'USA': '#1A2A3A'})
-    fig.update_layout(xaxis_tickangle=-90)
-    return fig
+# --- PREPROCESAMIENTO ---
+visitas["Periodo"] = pd.to_datetime(visitas["Periodo"], errors="coerce")
+visitas["Año"] = visitas["Periodo"].dt.year
+visitas["Tipo de sitio"] = visitas["Tipo de sitio"].str.strip().str.title()
+visitas["Centro de trabajo"] = visitas["Centro de trabajo"].str.strip()
+visitas["Número de visitas"] = pd.to_numeric(visitas["Número de visitas"], errors="coerce").fillna(0)
 
-# Función especial para gráfica de cilindros
-def generate_cylinders_chart(df):
-    if df.empty or 'Cylinders' not in df.columns:
-        return px.bar(title="No data available for Cylinders")
-    
-    # Convertir cilindros a enteros y luego a strings para mostrar como categorías
-    df = df.copy()
-    df['Cylinders'] = df['Cylinders'].astype(float).astype(int).astype(str)
-    
-    # Filtrar solo cilindros con datos
-    valid_cylinders = df['Cylinders'].unique()
-    
-    grouped = df.groupby('Cylinders').agg({
-        'Total cost from Mexico (with tariff)': 'mean',
-        'Production cost US': 'mean'
-    }).reset_index()
-    grouped = grouped.rename(columns={
-        'Total cost from Mexico (with tariff)': 'Mexico + Tariff',
-        'Production cost US': 'USA'
-    })
-    melted = pd.melt(grouped, id_vars='Cylinders',
-                    value_vars=['Mexico + Tariff', 'USA'],
-                    var_name='Production Origin', value_name='Average Cost')
-    
-    fig = px.bar(melted, x='Cylinders', y='Average Cost', color='Production Origin', 
-                 barmode='group', category_orders={"Cylinders": sorted(valid_cylinders, key=lambda x: int(x))},
-                 title='Cost by Cylinders', 
-                 color_discrete_map={'Mexico + Tariff': '#60809c', 'USA': '#1A2A3A'})
-    
-    fig.update_layout(
-        xaxis={'type': 'category', 'title': 'Number of Cylinders'},
-        yaxis={'title': 'Average Cost'},
-        xaxis_tickangle=0
-    )
-    
-    return fig
+# --- MAPA INTERACTIVO CON MENÚ ---
+museos_df = museos.rename(columns={"gmaps_latitud": "latitud", "gmaps_longitud": "longitud"})
+museos_df["tipo"] = "Museo"
+zonas_df = zonas.copy()
+zonas_df["tipo"] = "Zona Arqueológica"
+lugares = pd.concat([museos_df, zonas_df], ignore_index=True)
 
-# Línea del tiempo
-def generate_timeline(df):
-    if df.empty or 'Date' not in df.columns:
-        return px.line(title="No timeline data available")
+fig_mapa = px.scatter_mapbox(
+    lugares, lat="latitud", lon="longitud", color="tipo",
+    zoom=4.2, height=600, mapbox_style="carto-positron",
+    center={"lat": 24, "lon": -102},
+    title="Museos y Zonas Arqueológicas en México"
+)
+fig_mapa.update_layout(
+    title_x=0.5,
+    margin={"r":0,"t":50,"l":0,"b":0},
+    legend_title="Tipo de Lugar",
+    updatemenus=[{
+        "buttons": [
+            {"label": "Museos y Zonas Arqueológicas", "method": "update", "args": [{"visible": [True]*len(lugares)}, {"title": "Todos"}]},
+            {"label": "Museos", "method": "update", "args": [{"visible": lugares["tipo"] == "Museo"}, {"title": "Museos"}]},
+            {"label": "Zonas Arqueológicas", "method": "update", "args": [{"visible": lugares["tipo"] == "Zona Arqueológica"}, {"title": "Zonas Arqueológicas"}]},
+        ],
+        "direction": "down",
+        "showactive": True,
+        "x": 1.005, "xanchor": "left", "y": 0.85, "yanchor": "top"
+    }]
+)
+
+# --- TOP 5 MUSEOS POR ESTADO ---
+museos["nom_ent"] = museos["nom_ent"].replace("Veracruz de Ignacio de la Llave", "Veracruz")
+top_estados_museos = museos["nom_ent"].value_counts().nlargest(5).reset_index()
+top_estados_museos.columns = ["Estado", "Cantidad de Museos"]
+fig_museos = px.bar(top_estados_museos, x="Cantidad de Museos", y="Estado", orientation="h",
+                    color_discrete_sequence=["#6D48E7"],
+                    title="Top 5 Estados con Más Museos en México")
+fig_museos.update_layout(title_x=0.5, yaxis_title=None)
+
+# --- TOP 5 ZONAS POR ESTADO ---
+zonas["nom_ent"] = zonas["nom_ent"].replace({"MÃ©xico": "Edo. de México", "YucatÃ¡n": "Yucatán"})
+top_estados_zonas = zonas["nom_ent"].value_counts().nlargest(5).reset_index()
+top_estados_zonas.columns = ["Estado", "Cantidad de Zonas"]
+fig_zonas = px.bar(top_estados_zonas, x="Cantidad de Zonas", y="Estado", orientation="h",
+                   color_discrete_sequence=["#DC5252"], text="Cantidad de Zonas",
+                   title="Top 5 Estados con Más Zonas Arqueológicas en México")
+fig_zonas.update_traces(textposition="outside")
+fig_zonas.update_layout(title_x=0.5, yaxis_title=None)
+
+# --- SERIE TEMPORAL DE SITIOS DISPONIBLES ---
+conteo = visitas.groupby(["Año", "Tipo de sitio"])["Centro de trabajo"].nunique().reset_index(name="Cantidad de Sitios")
+conteo = conteo[conteo["Tipo de sitio"].isin(["Museo", "Zona Arqueológica"])]
+fig_tiempo = px.line(conteo, x="Año", y="Cantidad de Sitios", color="Tipo de sitio",
+                     color_discrete_map={"Museo": "#6D48E7", "Zona Arqueológica": "#DC5252"},
+                     markers=True,
+                     title="Museos y Zonas Arqueológicas Disponibles por Año")
+fig_tiempo.update_layout(title_x=0.5, xaxis=dict(dtick=1, range=[1996, 2024]), yaxis_title="Cantidad de Sitios")
+
+# --- TOP 10 ZONAS MÁS VISITADAS (INTERACTIVO POR AÑO) ---
+df_zonas = visitas[visitas["Tipo de sitio"] == "Zona Arqueológica"]
+anios_z = sorted(df_zonas["Año"].dropna().unique())
+fig_zonas_visita = go.Figure()
+for i, anio in enumerate(anios_z):
+    top = df_zonas[df_zonas["Año"] == anio].groupby("Centro de trabajo")["Número de visitas"].sum().nlargest(10).reset_index()
+    fig_zonas_visita.add_trace(go.Bar(x=top["Número de visitas"], y=top["Centro de trabajo"],
+        orientation="h", name=str(anio), visible=(i == 0), marker_color="#6D48E7"))
+buttons2 = [dict(label=str(anio), method="update",
+    args=[{"visible": [i == j for j in range(len(anios_z))]},
+          {"title": f"Top 10 Zonas Arqueológicas Más Visitadas en {anio}"}])
+    for i, anio in enumerate(anios_z)]
+fig_zonas_visita.update_layout(title=f"Top 10 Zonas Arqueológicas Más Visitadas en {anios_z[0]}",
+    title_x=0.5, yaxis_title=None, yaxis=dict(autorange="reversed"),
+    updatemenus=[dict(buttons=buttons2, direction="down", showactive=True,
+                      x=1.05, xanchor="left", y=1, yanchor="top")])
+
+# --- TOP 10 MUSEOS MÁS VISITADOS (INTERACTIVO POR AÑO) ---
+df_museos = visitas[visitas["Tipo de sitio"] == "Museo"]
+anios_m = sorted(df_museos["Año"].dropna().unique())
+fig_museos_visita = go.Figure()
+for i, anio in enumerate(anios_m):
+    top = df_museos[df_museos["Año"] == anio].groupby("Centro de trabajo")["Número de visitas"].sum().nlargest(10).reset_index()
+    fig_museos_visita.add_trace(go.Bar(x=top["Número de visitas"], y=top["Centro de trabajo"],
+        orientation="h", name=str(anio), visible=(i == 0), marker_color="#DC5252"))
+buttons_m = [dict(label=str(anio), method="update",
+    args=[{"visible": [i == j for j in range(len(anios_m))]},
+          {"title": f"Top 10 Museos Más Visitados en {anio}"}])
+    for i, anio in enumerate(anios_m)]
+fig_museos_visita.update_layout(title=f"Top 10 Museos Más Visitados en {anios_m[0]}",
+    title_x=0.5, yaxis_title=None, yaxis=dict(autorange="reversed"),
+    updatemenus=[dict(buttons=buttons_m, direction="down", showactive=True,
+                      x=1.05, xanchor="left", y=1, yanchor="top")])
+
+# --- REGRESIÓN: ZONAS ARQUEOLÓGICAS ---
+df_zonas_pred = visitas[visitas["Tipo de sitio"] == "Zona Arqueológica"]
+nombres_zonas_all = sorted(df_zonas_pred["Centro de trabajo"].dropna().unique())
+rango_zonas = {}
+annotations_z = []
+fig_pred_zonas = go.Figure()
+
+# Filtrar nombres con datos suficientes para regresión
+nombres_zonas = []
+
+for i, nombre in enumerate(nombres_zonas_all):
+    df_filtrado = df_zonas_pred[df_zonas_pred["Centro de trabajo"] == nombre]
+    visitas_anio = df_filtrado.groupby("Año")["Número de visitas"].sum().reset_index()
     
-    timeline = df.copy()
-    timeline['Date'] = pd.to_datetime(timeline['Date'])
-    timeline = timeline.sort_values('Date')
-    timeline['Month'] = timeline['Date'].dt.to_period('M').astype(str)
-    grouped = timeline.groupby('Month').agg({'Total cost from Mexico (with tariff)': 'mean'}).reset_index()
-    fig = px.line(grouped, x='Month', y='Total cost from Mexico (with tariff)', title='Timeline: Average Cost from Mexico')
-    fig.update_layout(xaxis_title='X Axis', yaxis_title='Y Axis')
-    return fig
+    x = visitas_anio["Año"].values.reshape(-1, 1)
+    y = visitas_anio["Número de visitas"].values
+    if len(x) < 2:
+        continue  # Saltar si no hay suficientes datos
 
-# Cargar logos
-with open("logo.png", "rb") as f:
-    encoded_logo = base64.b64encode(f.read()).decode("utf-8")
-logo_src = f"data:image/png;base64,{encoded_logo}"
+    model = LinearRegression().fit(x, y)
+    next_year = x.max() + 1
+    y_pred = model.predict([[next_year]])[0]
 
-with open("stellar.png", "rb") as f:
-    encoded_stellar_logo = base64.b64encode(f.read()).decode("utf-8")
-stellar_logo_src = f"data:image/png;base64,{encoded_stellar_logo}"
+    x_range = np.append(x.flatten(), next_year)
+    y_fit = model.predict(x_range.reshape(-1, 1))
+    rango_zonas[nombre] = (x.min(), next_year)
 
-# Layout
+    # Guardar nombre válido
+    nombres_zonas.append(nombre)
+
+    fig_pred_zonas.add_trace(go.Scatter(
+        x=visitas_anio["Año"], y=visitas_anio["Número de visitas"],
+        mode='lines+markers', name=nombre,
+        visible=False, line=dict(color="#6D48E7"), marker=dict(size=8)
+    ))
+    fig_pred_zonas.add_trace(go.Scatter(
+        x=x_range, y=y_fit, mode="lines", name=f"Regresión - {nombre}",
+        visible=False, line=dict(dash='dot', color="gray")
+    ))
+    annotations_z.append(dict(
+        x=next_year, y=y_pred,
+        text=f"Predicción {next_year}: {int(y_pred):,} visitas",
+        showarrow=True, arrowhead=2, ax=-50, ay=-40,
+        font=dict(size=12, color="blue"), bgcolor="white",
+        bordercolor="blue", borderwidth=1, opacity=0.9, visible=False
+    ))
+
+# Si no hay nombres válidos, evitar error
+if nombres_zonas:
+    # Hacer visible solo la primera
+    fig_pred_zonas.data[0].visible = True
+    fig_pred_zonas.data[1].visible = True
+    annotations_z[0]['visible'] = True
+
+buttons_z = []
+for i, nombre in enumerate(nombres_zonas):
+    vis = [False] * len(fig_pred_zonas.data)
+    vis[2 * i] = vis[2 * i + 1] = True
+    annots = [dict(a, visible=(j == i)) for j, a in enumerate(annotations_z)]
+    buttons_z.append(dict(
+        label=nombre, method="update",
+        args=[{"visible": vis},
+              {"title": f"Visitantes por año en: {nombre}",
+               "xaxis": {"range": rango_zonas[nombre]},
+               "yaxis": {"range": [0, None]},
+               "annotations": annots}]
+    ))
+
+fig_pred_zonas.update_layout(
+    title=f"Visitantes por año en: {nombres_zonas[0] if nombres_zonas else 'N/A'}",
+    title_x=0.5, xaxis_title="Año", yaxis_title="Número de visitas",
+    margin=dict(t=100), xaxis_range=[*rango_zonas[nombres_zonas[0]]] if nombres_zonas else None,
+    yaxis_range=[0, None], annotations=[annotations_z[0]] if annotations_z else None,
+    updatemenus=[dict(
+        buttons=buttons_z, direction="down", showactive=True,
+        x=0.5, xanchor="center", y=1.15, yanchor="top"
+    )] if nombres_zonas else []
+)
+
+# --- REGRESIÓN: MUSEOS ---
+# --- REGRESIÓN: MUSEOS ---
+df_museos_pred = visitas[visitas["Tipo de sitio"] == "Museo"]
+nombres_museos_all = sorted(df_museos_pred["Centro de trabajo"].dropna().unique())
+rango_museos = {}
+annotations_m = []
+fig_pred_museos = go.Figure()
+
+# Filtrar nombres con datos suficientes para regresión
+nombres_museos = []
+
+for i, nombre in enumerate(nombres_museos_all):
+    df_filtrado = df_museos_pred[df_museos_pred["Centro de trabajo"] == nombre]
+    visitas_anio = df_filtrado.groupby("Año")["Número de visitas"].sum().reset_index()
+    
+    x = visitas_anio["Año"].values.reshape(-1, 1)
+    y = visitas_anio["Número de visitas"].values
+    if len(x) < 2:
+        continue  # Saltar si no hay suficientes datos
+
+    model = LinearRegression().fit(x, y)
+    next_year = x.max() + 1
+    y_pred = model.predict([[next_year]])[0]
+
+    x_range = np.append(x.flatten(), next_year)
+    y_fit = model.predict(x_range.reshape(-1, 1))
+    rango_museos[nombre] = (x.min(), next_year)
+
+    # Guardar nombre válido
+    nombres_museos.append(nombre)
+
+    fig_pred_museos.add_trace(go.Scatter(
+        x=visitas_anio["Año"], y=visitas_anio["Número de visitas"],
+        mode='lines+markers', name=nombre,
+        visible=False, line=dict(color="#DC5252"), marker=dict(size=8)
+    ))
+    fig_pred_museos.add_trace(go.Scatter(
+        x=x_range, y=y_fit, mode="lines", name=f"Regresión - {nombre}",
+        visible=False, line=dict(dash='dot', color="gray")
+    ))
+    annotations_m.append(dict(
+        x=next_year, y=y_pred,
+        text=f"Predicción {next_year}: {int(y_pred):,} visitas",
+        showarrow=True, arrowhead=2, ax=-50, ay=-40,
+        font=dict(size=12, color="red"), bgcolor="white",
+        bordercolor="red", borderwidth=1, opacity=0.9, visible=False
+    ))
+
+# Si no hay nombres válidos, evitar error
+if nombres_museos:
+    # Hacer visible solo la primera
+    fig_pred_museos.data[0].visible = True
+    fig_pred_museos.data[1].visible = True
+    annotations_m[0]['visible'] = True
+
+buttons_m = []
+for i, nombre in enumerate(nombres_museos):
+    vis = [False] * len(fig_pred_museos.data)
+    vis[2 * i] = vis[2 * i + 1] = True
+    annots = [dict(a, visible=(j == i)) for j, a in enumerate(annotations_m)]
+    buttons_m.append(dict(
+        label=nombre, method="update",
+        args=[{"visible": vis},
+              {"title": f"Visitantes por año en: {nombre}",
+               "xaxis": {"range": rango_museos[nombre]},
+               "yaxis": {"range": [0, None]},
+               "annotations": annots}]
+    ))
+
+fig_pred_museos.update_layout(
+    title=f"Visitantes por año en: {nombres_museos[0] if nombres_museos else 'N/A'}",
+    title_x=0.5, xaxis_title="Año", yaxis_title="Número de visitas",
+    margin=dict(t=100), xaxis_range=[*rango_museos[nombres_museos[0]]] if nombres_museos else None,
+    yaxis_range=[0, None], annotations=[annotations_m[0]] if annotations_m else None,
+    updatemenus=[dict(
+        buttons=buttons_m, direction="down", showactive=True,
+        x=0.5, xanchor="center", y=1.15, yanchor="top"
+    )] if nombres_museos else []
+)
+
+# Cargar imágenes como base64
+with open("inegi.png", "rb") as f:
+    encoded_inegi_logo = base64.b64encode(f.read()).decode("utf-8")
+inegi_logo_src = f"data:image/png;base64,{encoded_inegi_logo}"
+
+with open("cultura.png", "rb") as f:
+    encoded_cultura_logo = base64.b64encode(f.read()).decode("utf-8")
+cultura_logo_src = f"data:image/png;base64,{encoded_cultura_logo}"
+
 app = dash.Dash(__name__)
-app.title = "Dashboard Profesional Completo"
+app.title = "Dashboard Museos y Zonas Arqueológicas"
 
-app.layout = html.Div(style={"fontFamily": "Segoe UI", "backgroundColor": "#1A2A3A", "padding": "20px"}, children=[
-    html.Div(style={"display": "flex", "alignItems": "center", "justifyContent": "space-between", "marginBottom": "20px"}, children=[
-        html.Img(src=logo_src, style={"height": "200px"}),
+app.layout = html.Div([
+    # Encabezado con logos y título
+    html.Div([
+        html.Img(src=inegi_logo_src, style={
+            "height": "140px",
+            "width": "auto",
+            "objectFit": "contain"
+        }),
+        html.H1("Museos y Zonas Arqueológicas de México", style={
+            "flex": "1",
+            "textAlign": "center",
+            "color": "#2c3e50",
+            "fontFamily": "'Montserrat', sans-serif",
+            "fontWeight": "700",
+            "fontSize": "2.5rem",
+            "margin": "0"
+        }),
+        html.Img(src=cultura_logo_src, style={
+            "height": "200px",
+            "width": "auto",
+            "objectFit": "contain"
+        }),
+    ], style={
+        "display": "flex",
+        "alignItems": "center",
+        "justifyContent": "space-between",
+        "padding": "10px 40px",
+        "borderBottom": "3px solid #6D48E7",
+        "backgroundColor": "#f9f9fc",
+        "boxShadow": "0 3px 10px rgba(0,0,0,0.05)"
+    }),
 
-        html.Div(style={"textAlign": "center", "flexGrow": "1"}, children=[
-            html.H1("MX+tariff vs USA Strategic Analysis", style={"color": "white", "marginTop": "5px", 'fontSize': '40px'})
-        ]),
+    # HIGHLIGHTS
+    html.Div([
+        html.Div([
+            html.H4("Total Museos", style={"color": "#6D48E7", "marginBottom": "0"}),
+            html.P(f"{len(museos):,}", style={"fontSize": "28px", "fontWeight": "bold", "marginTop": "5px"})
+        ], style={
+            "width": "22%", "padding": "15px", "backgroundColor": "#f9f9f9",
+            "border": "2px solid #6D48E7", "borderRadius": "10px",
+            "textAlign": "center", "boxShadow": "2px 2px 8px rgba(0,0,0,0.05)"
+        }),
 
-        html.Img(src=stellar_logo_src, style={"height": "60px"})
-    ]),
+        html.Div([
+            html.H4("Total Zonas", style={"color": "#800000", "marginBottom": "0"}),
+            html.P(f"{len(zonas):,}", style={"fontSize": "28px", "fontWeight": "bold", "marginTop": "5px"})
+        ], style={
+            "width": "22%", "padding": "15px", "backgroundColor": "#fdf7f5",
+            "border": "2px solid #800000", "borderRadius": "10px",
+            "textAlign": "center", "boxShadow": "2px 2px 8px rgba(0,0,0,0.05)"
+        }),
 
-    html.Div(style={"display": "flex", "justifyContent": "center", "marginBottom": "20px"}, children=[
-        html.Div(style={"width": "50%"}, children=[
-            html.Label("Manufacturer", style={'textAlign': 'center', 'color': 'white', 'fontWeight': 'bold'}), 
-            dcc.Dropdown(
-                id='manufacturer-filter', 
-                options=[],  # Se llenará dinámicamente
-                multi=True,
-                placeholder="Select Manufacturer(s)"
-            )
-        ])
-    ]),
+        html.Div([
+            html.H4("Total Registros de Visitas", style={"color": "#444", "marginBottom": "0"}),
+            html.P(f"{len(visitas):,}", style={"fontSize": "28px", "fontWeight": "bold", "marginTop": "5px"})
+        ], style={
+            "width": "22%", "padding": "15px", "backgroundColor": "#f3f3f3",
+            "border": "2px solid #999", "borderRadius": "10px",
+            "textAlign": "center", "boxShadow": "2px 2px 8px rgba(0,0,0,0.05)"
+        }),
 
-    html.Div(style={"display": "flex", "gap": "20px", "marginBottom": "20px"}, children=[
-        html.Div(style={"flex": 1}, children=[
-            html.Label("Model", style={'textAlign': 'center', 'color': 'white', 'fontWeight': 'bold'}), 
-            dcc.Dropdown(
-                id='model-filter', 
-                options=[],  # Se llenará dinámicamente
-                multi=True,
-                placeholder="Select Model(s)"
-            )
-        ]),
-        html.Div(style={"flex": 1}, children=[
-            html.Label("Category", style={'textAlign': 'center', 'color': 'white', 'fontWeight': 'bold'}), 
-            dcc.Dropdown(
-                id='category-filter', 
-                options=[],  # Se llenará dinámicamente
-                multi=True,
-                placeholder="Select Category(s)"
-            )
-        ]),
-        html.Div(style={"flex": 1}, children=[
-            html.Label("Fuel Type", style={'textAlign': 'center', 'color': 'white', 'fontWeight': 'bold'}), 
-            dcc.Dropdown(
-                id='fuel-filter', 
-                options=[],  # Se llenará dinámicamente
-                multi=True,
-                placeholder="Select Fuel Type(s)"
-            )
-        ]),
-        html.Div(style={"flex": 1}, children=[
-            html.Label("Cylinders", style={'textAlign': 'center', 'color': 'white', 'fontWeight': 'bold'}), 
-            dcc.Dropdown(
-                id='cylinders-filter', 
-                options=[],  # Se llenará dinámicamente
-                multi=True,
-                placeholder="Select Cylinders"
-            )
-        ])
-    ]),
+        html.Div([
+            html.H4("Último Año Registrado", style={"color": "#CFAF5F", "marginBottom": "0"}),
+            html.P(f"{int(visitas['Año'].max())}", style={"fontSize": "28px", "fontWeight": "bold", "marginTop": "5px"})
+        ], style={
+            "width": "22%", "padding": "15px", "backgroundColor": "#fffdf5",
+            "border": "2px solid #CFAF5F", "borderRadius": "10px",
+            "textAlign": "center", "boxShadow": "2px 2px 8px rgba(0,0,0,0.05)"
+        }),
+    ], style={
+        "display": "flex", "justifyContent": "space-around", "margin": "30px 0",
+        "fontFamily": "Segoe UI, Roboto, sans-serif"
+    }),
 
-    html.Div(id='kpi-cards', style={"display": "flex", "gap": "20px", "marginBottom": "30px"}),
+    # GRÁFICOS
+    dcc.Graph(id="mapa", figure=fig_mapa),
 
-    html.Div(style={"display": "flex", "flexWrap": "wrap", "justifyContent": "space-between", "gap": "20px"}, children=[
-        html.Div(style={"width": "48%"}, children=[dcc.Graph(id='manufacturer-chart')]),
-        html.Div(style={"width": "48%"}, children=[dcc.Graph(id='model-chart')]),
-        html.Div(style={"width": "48%"}, children=[dcc.Graph(id='category-chart')]),
-        html.Div(style={"width": "48%"}, children=[dcc.Graph(id='fuel-chart')]),
-        html.Div(style={"width": "48%"}, children=[dcc.Graph(id='cylinders-chart')]),
-        html.Div(style={"width": "48%"}, children=[dcc.Graph(id='gear-chart')]),
-        html.Div(style={"width": "100%"}, children=[dcc.Graph(id='timeline-chart')])
-    ]),
+    html.Div([
+        html.Div(dcc.Graph(figure=fig_museos), style={"width": "49%", "display": "inline-block", "verticalAlign": "top"}),
+        html.Div(dcc.Graph(figure=fig_zonas), style={"width": "49%", "display": "inline-block", "verticalAlign": "top", "marginLeft": "2%"}),
+    ], style={"width": "100%", "display": "flex", "justifyContent": "space-between"}),
 
-    html.H3("Tabla de Datos Filtrados", style={"marginTop": "30px", "color": "white"}),
-    dcc.Graph(id='table')
-])
+    dcc.Graph(figure=fig_tiempo),
 
-# Callback para actualizar opciones de dropdowns
+    html.Div([
+        html.Div(dcc.Graph(figure=fig_zonas_visita), style={"width": "49%", "display": "inline-block", "verticalAlign": "top"}),
+        html.Div(dcc.Graph(figure=fig_museos_visita), style={"width": "49%", "display": "inline-block", "verticalAlign": "top", "marginLeft": "2%"}),
+    ], style={"width": "100%", "display": "flex", "justifyContent": "space-between"}),
+
+    dcc.Graph(figure=fig_pred_zonas),
+    dcc.Graph(figure=fig_pred_museos),
+
+    html.Hr(),
+
+    # INFORMACIÓN Y DROPDOWNS
+    html.H3("Información de contacto del sitio seleccionado",
+            style={"textAlign": "center", "color": "#333", "fontFamily": "Segoe UI, Roboto, sans-serif"}),
+
+    html.Div([
+        html.Label("Tipo de sitio:", style={"fontWeight": "bold", "color": "#444"}),
+        dcc.Dropdown(
+            id="tipo-dropdown",
+            options=[
+                {"label": "Museo", "value": "Museo"},
+                {"label": "Zona Arqueológica", "value": "Zona Arqueológica"}
+            ],
+            value="Museo",
+            clearable=False,
+            style={"width": "300px", "marginBottom": "15px"}
+        ),
+    ], style={"margin": "10px"}),
+
+    html.Div([
+        html.Label("Nombre del sitio:", style={"fontWeight": "bold", "color": "#444"}),
+        dcc.Dropdown(
+            id="sitio-dropdown",
+            options=[],  # Dinámico
+            clearable=False,
+            style={"width": "500px"}
+        ),
+    ], style={"margin": "10px"}),
+
+    html.Div(id="info-sitio", style={
+        "margin": "10px 20px", "whiteSpace": "pre-line", "fontSize": "16px",
+        "backgroundColor": "#f5f5f5", "padding": "15px", "borderRadius": "8px",
+        "border": "1px solid #ccc", "fontFamily": "Segoe UI, Roboto, sans-serif"
+    })
+
+], style={"backgroundColor": "#f1f4f9", "padding": "20px", "fontFamily": "Segoe UI, Roboto, sans-serif"})
+
+
+# --- CALLBACKS ---
 @app.callback(
-    [Output('manufacturer-filter', 'options'),
-     Output('model-filter', 'options'),
-     Output('category-filter', 'options'),
-     Output('fuel-filter', 'options'),
-     Output('cylinders-filter', 'options')],
-    [Input('manufacturer-filter', 'value'),
-     Input('model-filter', 'value'),
-     Input('category-filter', 'value'),
-     Input('fuel-filter', 'value'),
-     Input('cylinders-filter', 'value')]
+    Output("sitio-dropdown", "options"),
+    Output("sitio-dropdown", "value"),
+    Input("tipo-dropdown", "value")
 )
-def update_dropdown_options(manufacturers, models, categories, fuels, cylinders):
-    # Construir filtros para la consulta
-    filters = {}
-    if manufacturers:
-        filters['Manufacturer'] = manufacturers
-    if models:
-        filters['Model'] = models
-    if categories:
-        filters['Category'] = categories
-    if fuels:
-        filters['Fuel type'] = fuels
-    if cylinders:
-        filters['Cylinders'] = cylinders
-    
-    # Consultar datos con los filtros actuales
-    df = query_data(filters)
-    
-    # Obtener valores únicos para cada dropdown
-    manufacturer_options = [{'label': m, 'value': m} for m in sorted(df['Manufacturer'].dropna().unique())] if not df.empty else []
-    model_options = [{'label': m, 'value': m} for m in sorted(df['Model'].dropna().unique())] if not df.empty else []
-    category_options = [{'label': c, 'value': c} for c in sorted(df['Category'].dropna().unique())] if not df.empty else []
-    fuel_options = [{'label': f, 'value': f} for f in sorted(df['Fuel type'].dropna().unique())] if not df.empty else []
-    
-    # Opciones especiales para cilindros (mostrar como enteros)
-    if not df.empty and 'Cylinders' in df.columns:
-        cylinders_options = [{'label': str(int(float(c))), 'value': str(int(float(c)))} 
-                            for c in sorted(df['Cylinders'].dropna().unique())]
+def actualizar_sitios(tipo):
+    if tipo == "Museo":
+        nombres = sorted(museos["museo_nombre"].dropna().unique())
     else:
-        cylinders_options = []
-    
-    return (
-        manufacturer_options,
-        model_options,
-        category_options,
-        fuel_options,
-        cylinders_options
-    )
+        nombres = sorted(zonas["zona_arqueologica_nombre"].dropna().unique())
+    opciones = [{"label": nombre, "value": nombre} for nombre in nombres]
+    valor = nombres[0] if nombres else None
+    return opciones, valor
 
-# Callback principal para actualizar todo el dashboard
 @app.callback(
-    [Output('kpi-cards', 'children'),
-     Output('manufacturer-chart', 'figure'),
-     Output('model-chart', 'figure'),
-     Output('category-chart', 'figure'),
-     Output('fuel-chart', 'figure'),
-     Output('cylinders-chart', 'figure'),
-     Output('gear-chart', 'figure'),
-     Output('timeline-chart', 'figure'),
-     Output('table', 'figure')],
-    [Input('manufacturer-filter', 'value'),
-     Input('model-filter', 'value'),
-     Input('category-filter', 'value'),
-     Input('fuel-filter', 'value'),
-     Input('cylinders-filter', 'value')]
+    Output("info-sitio", "children"),
+    Input("tipo-dropdown", "value"),
+    Input("sitio-dropdown", "value")
 )
-def update_dashboard(manufacturers, models, categories, fuels, cylinders):
-    # Construir filtros para la consulta
-    filters = {}
-    if manufacturers:
-        filters['Manufacturer'] = manufacturers
-    if models:
-        filters['Model'] = models
-    if categories:
-        filters['Category'] = categories
-    if fuels:
-        filters['Fuel type'] = fuels
-    if cylinders:
-        filters['Cylinders'] = [int(c) if isinstance(c, str) and c.replace('.','',1).isdigit() else c for c in cylinders]
-    
-    # Consultar datos con los filtros actuales
-    df = query_data(filters)
-    
-    # Calcular KPIs
-    if not df.empty:
-        avg_mexico = df['Total cost from Mexico (with tariff)'].mean()
-        avg_usa = df['Production cost US'].mean()
-        diff = avg_mexico - avg_usa
-        models_count = df['Model'].nunique()
+def mostrar_info(tipo, nombre):
+    if not nombre:
+        return "Selecciona un sitio válido."
+
+    if tipo == "Museo":
+        fila = museos[museos["museo_nombre"] == nombre]
+        if fila.empty:
+            return "Museo no encontrado."
+        fila = fila.iloc[0]
+        telefono = fila.get("museo_telefono1", "No disponible")
     else:
-        avg_mexico = avg_usa = diff = models_count = 0
+        fila = zonas[zonas["zona_arqueologica_nombre"] == nombre]
+        if fila.empty:
+            return "Zona no encontrada."
+        fila = fila.iloc[0]
+        telefono = fila.get("zona_arqueologica_telefono1", "No disponible")
 
-    kpis = [
-        html.Div(style={"flex": 1, "padding": "15px", "backgroundColor": "#EAF4FF", "borderRadius": "10px", "textAlign": "center", "boxShadow": "0 2px 6px rgba(0,0,0,0.1)"}, children=[
-            html.H4("Average Cost Mexico"), html.H2(f"${avg_mexico:,.2f}" if not pd.isna(avg_mexico) else "-")
-        ]),
-        html.Div(style={"flex": 1, "padding": "15px", "backgroundColor": "#EAF4FF", "borderRadius": "10px", "textAlign": "center", "boxShadow": "0 2px 6px rgba(0,0,0,0.1)"}, children=[
-            html.H4("Average Cost USA"), html.H2(f"${avg_usa:,.2f}" if not pd.isna(avg_usa) else "-")
-        ]),
-        html.Div(style={"flex": 1, "padding": "15px", "backgroundColor": "#EAF4FF", "borderRadius": "10px", "textAlign": "center", "boxShadow": "0 2px 6px rgba(0,0,0,0.1)"}, children=[
-            html.H4("Difference"), html.H2(f"${diff:,.2f}" if not pd.isna(diff) else "-")
-        ]),
-        html.Div(style={"flex": 1, "padding": "15px", "backgroundColor": "#EAF4FF", "borderRadius": "10px", "textAlign": "center", "boxShadow": "0 2px 6px rgba(0,0,0,0.1)"}, children=[
-            html.H4("Unique Models"), html.H2(str(models_count))
-        ])
-    ]
+    web = fila.get("pagina_web", "No disponible")
+    email = fila.get("email", "No disponible")
 
-    # Generar gráficas
-    manufacturer_fig = generate_chart(df, 'Manufacturer', 'Cost by Manufacturer')
-    model_fig = generate_chart(df, 'Model', 'Cost by Model')
-    category_fig = generate_chart(df, 'Category', 'Cost by Category')
-    fuel_fig = generate_chart(df, 'Fuel type', 'Cost by Fuel type')
-    cylinders_fig = generate_cylinders_chart(df)  # Usamos la función especial para cilindros
-    gear_fig = generate_chart(df, 'Gear box type', 'Cost by Gear box type')
-    timeline_fig = generate_timeline(df)
-
-    # Generar tabla
-    table_fig = {
-        'data': [{
-            'type': 'table',
-            'header': {'values': list(df.columns), 'fill': {'color': '#1A2A3A'}, 'font': {'color': 'white'}},
-            'cells': {'values': [df[col] for col in df.columns], 'fill': {'color': '#EAF4FF'}}
-        }],
-        'layout': {'margin': {'t': 10}}
-    } if not df.empty else {
-        'data': [{
-            'type': 'table',
-            'header': {'values': ['No data available'], 'fill': {'color': '#1A2A3A'}, 'font': {'color': 'white'}},
-            'cells': {'values': [[]], 'fill': {'color': '#EAF4FF'}}
-        }],
-        'layout': {'margin': {'t': 10}}
-    }
-
-    return (
-        kpis,
-        manufacturer_fig,
-        model_fig,
-        category_fig,
-        fuel_fig,
-        cylinders_fig,
-        gear_fig,
-        timeline_fig,
-        table_fig
+    info_texto = (
+        f"📞 Teléfono: {telefono}\n"
+        f"🌐 Página web: {web}\n"
+        f"✉️ Correo electrónico: {email}"
     )
+    return info_texto
 
 server = app.server  # <- Esto sigue siendo necesario para Render
 
