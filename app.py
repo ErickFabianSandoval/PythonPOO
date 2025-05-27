@@ -2,18 +2,28 @@ import dash
 from dash import html, dcc, Input, Output
 import pandas as pd
 import plotly.express as px
-from pymongo import MongoClient
 import base64
 import datetime
 import random
+from pymongo import MongoClient
+from pymongo.server_api import ServerApi
 
+# URI con tu usuario y contraseña
+uri = f"mongodb+srv://erickfabian845:kikini1@cluster0.v22gzsc.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 
-# Conectarse a Atlas
-mongo_uri = "mongodb+srv://erickfabian845:kikini1@cluster0.v22gzsc.mongodb.net/"
-client = MongoClient(mongo_uri)
+try:
+    # Conexión con API de servidor moderna
+    client = MongoClient(uri, server_api=ServerApi('1'))
+    db = client["autosDB"]
+    collection = db["precio_autos"]
 
-db = client["autosDB"]
-collection = db["precio_autos"]
+    # Probar si hay conexión y documentos
+    count = collection.count_documents({})
+    print(f"✅ Conexión exitosa a MongoDB. Documentos en colección: {count}")
+
+except Exception as e:
+    print("❌ Error al conectar con MongoDB Atlas:")
+    print(e)
 
 # Función para consultar datos con filtros
 def query_data(filters=None):
